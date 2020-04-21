@@ -1,0 +1,129 @@
+#!/bin/sh
+
+set -eu -o pipefail
+
+CONTAINER_NAME="eap_proxy-udmpro"
+IMAGE_NAME="pbrah/eap_proxy-udmpro"
+IMAGE_TAG="v1.1"
+
+
+container_exists() {
+	podman container inspect "${1}" &>/dev/null
+}
+
+image_exists() {
+	podman inspect --type=image "${1}" &>/dev/null
+}
+
+container_is_running() {
+	[ "$(podman inspect -f '{{.State.Running}}' "${1}" 2>&1)" = "true" ]
+}
+
+get_version() {
+	echo $(podman inspect --format '{{ index .Config.Labels "version"}}' "${1}")
+}
+
+run() {
+	echo "podman run ${1} ${2}"
+	podman run ${1} ${2}
+}
+
+start() {
+	local args
+	local container_id
+	local image_version
+	local container_version
+    local image_exists
+
+	image_version=$(get_version "${IMAGE_NAME}:default")
+
+	if container_exists "${CONTAINER_NAME}"; then
+		if container_is_running "${CONTAINER_NAME}"; then
+			echo "${CONTAINER_NAME} is already running"
+			return 0
+		fi
+		container_version=$(get_version "${CONTAINER_NAME}")
+		if [ "$container_version" != "$image_version" ]; then
+			echo "version mismatch, container has version ${container_version}, wanted ${image_version}, recreating container"
+			podman rm "${CONTAINER_NAME}" --force
+			podman rmi "${IMAGE_NAME}:default" &>/dev/null || true
+			podman rmi "${IMAGE_NAME}:${IMAGE_TAG}" || true
+			start
+			return
+		else
+			echo "podman commit ${CONTAINER_NAME} ${IMAGE_NAME}:${IMAGE_TAG}"
+			podman commit "${CONTAINER_NAME}" "${IMAGE_NAME}:${IMAGE_TAG}" ||
+			{
+				echo "podman commit failed, recreating from default"
+				podman rm "${CONTAINER_NAME}" --force
+				podman rmi "${IMAGE_NAME}:default" &>/dev/null || true
+				podman rmi "${IMAGE_NAME}:${IMAGE_TAG}" || true
+			}
+		fi
+	fi
+	echo "Starting ${CONTAINER_NAME}"
+
+	while [ ! -L /etc/resolv.conf ] || [ ! -e /etc/resolv.conf ]; do sleep 1; done
+	sleep 1
+
+	args="-d --name ${CONTAINER_NAME} --label version=${image_version} --network=host --privileged --stop-timeout=60 ${MOUNTS}"
+
+
+	podman rm "${CONTAINER_NAME}" --force &>/dev/null || true
+
+	if image_exists "${IMAGE_NAME}:${IMAGE_TAG}"; then
+		run "$args" "${IMAGE_NAME}:${IMAGE_TAG}" ||
+		{
+			echo "Starting container from ${IMAGE_NAME}:${IMAGE_TAG} failed, falling back to default"
+			run "$args" "${IMAGE_NAME}:default" ||
+			echo "Starting container from ${IMAGE_NAME}:default failed" >&2
+		}
+	else
+		run "$args" "${IMAGE_NAME}:default" ||
+		echo "Starting container from ${IMAGE_NAME}:default failed" >&2
+	fi
+}
+
+stop() {
+	if ! container_is_running "${CONTAINER_NAME}"; then
+		echo "${CONTAINER_NAME} is not running"
+	else
+		echo "Stopping ${CONTAINER_NAME}"
+		podman stop "${CONTAINER_NAME}"
+	fi
+}
+
+restart() {
+	stop
+	start
+}
+
+reset() {
+	stop
+	podman rm "${CONTAINER_NAME}" --force &>/dev/null || true
+	podman rmi "${IMAGE_NAME}:${IMAGE_TAG}" || true
+	start
+}
+
+cmd="${1:-start}"
+
+case "$cmd" in
+	stop)
+		stop 2>&1 | logger -st eap-proxy
+		;;
+	start)
+		start 2>&1 | logger -st eap-proxy
+		;;
+	reset)
+		reset 2>&1 | logger -st eap-proxy
+		;;
+	restart)
+		restart 2>&1 | logger -st eap-proxy
+		;;
+	shell)
+		podman exec -ti ${CONTAINER_NAME} bash
+		;;
+	*)
+		echo "Usage: $0 [stop start restart shell]"
+		;;
+esac
